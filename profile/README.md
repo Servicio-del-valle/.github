@@ -20,17 +20,25 @@ Sistema para descarga, almacenamiento y consulta de Comprobantes Fiscales Digita
 │                  IEPS.API (Backend .NET)                    │
 │  Auth · RazonSocial · Cfdi · Anexo4 · Usuarios · Perfiles   │
 │                    ↓ Al crear RS                            │
-│         Encola 13 meses en DescargaQueue                    │
+│         Encola 13 meses en DescargaQueue (26 jobs)          │
+│                    ↓ Al actualizar RFC/.cer/.key/pass        │
+│         Resetea jobs Error → Pendiente (reintento auto)     │
 └──────────────────────────┬──────────────────────────────────┘
                            │ SQL Server (100.68.142.117\SQLEXPRESS · DB: Hmg)
 ┌──────────────────────────▼──────────────────────────────────┐
-│              FiscalApi.Worker (Windows Service)             │
-│  Monitorea DescargaQueue · Dispara Core y PdfGenerator      │
+│         FiscalApi.Worker – 5 Shards en Paralelo             │
+│                                                             │
+│  Shard 1 (A-F) · Shard 2 (G-L) · Shard 3 (M-R)            │
+│  Shard 4 (S-Z) · Shard 5 (Overflow)                        │
+│                                                             │
+│  Cada shard: hasta 8 jobs en paralelo = 40 descargas        │
+│  concurrentes · pasó de horas a minutos                     │
 └──────┬─────────────────────────────────────┬────────────────┘
        │                                     │
        ▼                                     ▼
-FiscalApi.Core.exe                FiscalApi.PdfGenerator.exe
+FiscalApi.Core.dll                FiscalApi.PdfGenerator.dll
 (Descarga XMLs del SAT)           (Genera PDFs desde XML)
+(invocado como: dotnet <dll>)     (invocado como: dotnet <dll>)
 ```
 
 ---
@@ -78,7 +86,7 @@ Expone los endpoints que consume el frontend. Autenticación via JWT Bearer.
 | Auth | POST | `/api/auth/Authenticate` | Login → retorna JWT |
 | RazonSocial | GET | `/api/razonsocial/ListRazonesSociales/{IdCliente}` | Lista RS activas |
 | RazonSocial | POST | `/api/razonsocial/Create` | **Crea RS + dispara descarga automática** |
-| RazonSocial | PUT | `/api/razonsocial/Update` | Actualiza RS |
+| RazonSocial | PUT | `/api/razonsocial/Update` | Actualiza RS + **resetea jobs en Error si cambian credenciales FIEL** |
 | RazonSocial | DELETE | `/api/razonsocial/Delete/{id}` | Baja lógica RS |
 | Cfdi | POST | `/api/cfdi/ListCfdis` | Lista CFDIs con filtros |
 | Cfdi | GET | `/api/cfdi/Pdf/{uuid}` | Retorna PDF en base64 |
@@ -107,19 +115,61 @@ El método `EnqueueAsync(RFC)` inserta en `DescargaQueue` los 13 meses anteriore
 
 ---
 
-## 🤖 FiscalApi.Worker – Servicio de Fondo
+## 🤖 FiscalApi.Worker – Servicio de Fondo (Arquitectura Sharded)
 
-Windows Service que orquesta toda la automatización. Corre **3 procesos en paralelo**.
+Windows Service que orquesta toda la automatización de descargas SAT. Opera como **5 instancias independientes en paralelo (shards)**, cada una responsable de un rango de RFCs, logrando un rendimiento que pasó de **horas a minutos** para cientos de razones sociales.
 
-### Instalación como servicio
+### ¿Por qué Shards?
+
+La versión anterior era un único servicio con 2-3 jobs en paralelo. Con un despacho de ~500 razones sociales descargando hasta 26 meses (Recibido + Emitido), la cola tardaba horas en procesarse. La solución fue **particionar** la cola por la primera letra del RFC y correr 5 instancias simultáneas con hasta 8 jobs en paralelo cada una, resultando en hasta **40 descargas concurrentes**.
+
+### Partición por RFC (Shards)
+
+| Shard | Rango de letras | Servicio Windows |
+|---|---|---|
+| **Shard 1** | A – F | `FiscalApi.Worker.Shard1` |
+| **Shard 2** | G – L | `FiscalApi.Worker.Shard2` |
+| **Shard 3** | M – R | `FiscalApi.Worker.Shard3` |
+| **Shard 4** | S – Z | `FiscalApi.Worker.Shard4` |
+| **Shard 5** | Overflow / carga pesada | `FiscalApi.Worker.Shard5` |
+
+Cada job en `DescargaQueue` tiene la columna `Shard` (1–5) calculada al momento de encolarse. El Worker solo toma jobs cuyo `Shard` coincida con su configuración, garantizando que **nunca dos instancias procesan el mismo RFC al mismo tiempo**.
+
+### Instalación como servicio (5 instancias)
 
 ```bat
-install-service.bat          # Instala como Windows Service
-sc start FiscalApi.Worker    # Inicia el servicio
-sc stop  FiscalApi.Worker    # Detiene el servicio
+REM Cada shard es un servicio Windows independiente
+sc create "FiscalApi.Worker.Shard1" binPath= "C:\FiscalApi\Worker.Shard1\FiscalApi.Worker.exe" start= auto
+sc create "FiscalApi.Worker.Shard2" binPath= "C:\FiscalApi\Worker.Shard2\FiscalApi.Worker.exe" start= auto
+sc create "FiscalApi.Worker.Shard3" binPath= "C:\FiscalApi\Worker.Shard3\FiscalApi.Worker.exe" start= auto
+sc create "FiscalApi.Worker.Shard4" binPath= "C:\FiscalApi\Worker.Shard4\FiscalApi.Worker.exe" start= auto
+sc create "FiscalApi.Worker.Shard5" binPath= "C:\FiscalApi\Worker.Shard5\FiscalApi.Worker.exe" start= auto
+
+net start "FiscalApi.Worker.Shard1"
+net start "FiscalApi.Worker.Shard2"
+net start "FiscalApi.Worker.Shard3"
+net start "FiscalApi.Worker.Shard4"
+net start "FiscalApi.Worker.Shard5"
 ```
 
-### Configuración (appsettings.json)
+### Estructura en servidor
+
+```
+C:\FiscalApi\
+├── Worker.Shard1\          ← Binarios + appsettings con Shard=1
+├── Worker.Shard2\          ← Binarios + appsettings con Shard=2
+├── Worker.Shard3\          ← Binarios + appsettings con Shard=3
+├── Worker.Shard4\          ← Binarios + appsettings con Shard=4
+├── Worker.Shard5\          ← Binarios + appsettings con Shard=5
+├── shared-binaries\        ← Fuente de binarios para actualizar shards
+└── logs\
+    ├── Shard1\             ← Logs de orquestación del Shard 1
+    │   └── jobs\{RFC}\     ← Logs individuales por job
+    ├── Shard2\
+    ...
+```
+
+### Configuración por shard (appsettings.json)
 
 ```json
 {
@@ -127,46 +177,60 @@ sc stop  FiscalApi.Worker    # Detiene el servicio
     "Hmg": "data source=100.68.142.117\\SQLEXPRESS;Database=Hmg;..."
   },
   "Worker": {
-    "RutaExe": "C:\\Sistema\\FiscalApi.Core\\FiscalApi.Core.exe",
-    "RutaPdfGeneratorExe": "C:\\Sistema\\FiscalApi.PdfGenerator\\FiscalApi.PdfGenerator.exe",
+    "Shard": 1,
+    "RutaDll": "C:\\FiscalApi\\shared-binaries\\FiscalApi.Core.dll",
+    "RutaPdfGeneratorDll": "C:\\FiscalApi\\shared-binaries\\FiscalApi.PdfGenerator.dll",
     "PollingIntervalSeconds": "30",
-    "MaxJobsEnParalelo": "2"
+    "MaxJobsEnParalelo": "8"
+  },
+  "IEPSApi": {
+    "Url": "https://localhost/api"
   }
 }
 ```
 
-### Logs
+> **Nota:** El Worker invoca `FiscalApi.Core` y `FiscalApi.PdfGenerator` como `dotnet <dll>` (no `.exe`) para evitar bloqueos de Windows Application Control (Device Guard / WDAC) sobre ejecutables no firmados.
 
-Los logs se escriben en `logs/worker-YYYYMMDD.log` con retención de 14 días.
+### Logs – Dos niveles
+
+El Worker genera dos tipos de logs:
+
+1. **Log de orquestación** (`logs/ShardN/worker-YYYYMMDD.log`): arranque, polling, errores del propio Worker. Retención de 14 días (Serilog rolling).
+
+2. **Log por job** (`logs/ShardN/jobs/{RFC}/{YYYY-MM}-{TipoDescarga}-{JobId}.log`): todo el stdout/stderr de `FiscalApi.Core` y `FiscalApi.PdfGenerator` de ese job específico. Permite diagnosticar errores de un RFC sin buscar en un archivo gigante mezclado con todos los demás.
 
 ---
 
 ### 🔁 Proceso 1 – Worker (Cola Principal)
 
-Monitorea la tabla `DescargaQueue` y ejecuta las descargas.
+Monitorea la tabla `DescargaQueue` y ejecuta las descargas del shard asignado.
 
 ```
 Al arrancar:
-  1. Resetea jobs "EnProceso" huérfanos → Pendiente
+  1. Resetea jobs "EnProceso" huérfanos de este shard → Pendiente
      (recuperación ante crash del proceso anterior)
-  2. Por cada RFC en cola corre: FiscalApi.Core.exe sync {RFC}
+  2. Por cada RFC en cola del shard: FiscalApi.Core.dll sync {RFC}
      → Escanea disco, inserta ZIPs no registrados en BD
 
-Loop principal (cada 30 segundos, máx 2 jobs en paralelo):
+Loop principal (cada 30 segundos, máx 8 jobs en paralelo por shard):
   ┌─ Espera slot libre (SemaphoreSlim)
   ├─ TakeNextAsync() → UPDATE atómico: Pendiente → EnProceso
+  │   Prioridad: jobs manuales (EsManual=1) primero, luego por FechaCreacion
   │   (también procesa EnEsperaSAT con ProximoIntento vencido)
   │
   └─ EjecutarJobAsync():
-       FiscalApi.Core.exe {Anio} {Mes:D2} {RFC} --tipo Recibido|Emitido [--force]
+       dotnet FiscalApi.Core.dll {Anio} {Mes:D2} {RFC} --tipo Recibido|Emitido [--force]
+       Escribe stdout/stderr al log del job (logs/ShardN/jobs/{RFC}/...)
        ↓
        ExitCode = 0 ?
          ├─ Sí → ¿Job sigue EnProceso?
          │         Sí → MarcarCompletado()
-         │              + EjecutarPdfGeneratorAsync()
+         │              + await EjecutarPdfGeneratorAsync()   ← genera y guarda PDF en BD
          │         No → FiscalApi.Core lo cambió internamente (ej: EnEsperaSAT)
          └─ No → MarcarError(exitCode)
 ```
+
+> **Descarga manual**: cuando el usuario solicita una descarga manual desde la UI (rango de fechas específico), el job se encola con `EsManual=1` y tiene prioridad sobre los jobs nocturnos. El Worker y FiscalApi.Core detectan este flag para saltarse los early-exits (no omiten la solicitud al SAT aunque ya existan ZIPs en disco).
 
 #### Tabla de estatus DescargaQueue
 
@@ -175,8 +239,33 @@ Loop principal (cada 30 segundos, máx 2 jobs en paralelo):
 | `Pendiente` | En espera de ser procesado |
 | `EnProceso` | FiscalApi.Core corriendo ahora |
 | `EnEsperaSAT` | SAT aún no tiene la solicitud lista, reintento programado |
-| `Completado` | Descarga exitosa |
-| `Error` | Falló (ver columna `MensajeError`) |
+| `Completado` | Descarga exitosa + PDF generado |
+| `Error` | Falló (ver columna `MensajeError` con descripción legible) |
+
+#### Errores SAT detectados automáticamente
+
+El Worker clasifica los errores del SAT y los almacena en `MensajeError` con texto legible para el usuario:
+
+| Código SAT | Condición | Mensaje al usuario |
+|---|---|---|
+| `301` | RFC inválido (RfcEmisor/RfcReceptor) | "El RFC o contraseña son incorrectos. Verifique su información." |
+| `304` | Certificado Revocado o Caduco | "El certificado FIEL está revocado o caducado. Renueve su FIEL en el SAT." |
+| — | Error de certificado/firma | "Error de certificado FIEL. Verifique que .cer y .key correspondan al RFC." |
+| `301` | XML Mal Formado | "Solicitud rechazada por el SAT (XML Mal Formado). Verifique las credenciales FIEL." |
+| — | Sin RequestId / sin mensaje | "SAT no devolvió RequestId. Verifique credenciales FIEL y que el RFC esté habilitado." |
+
+#### Reintento automático al actualizar credenciales FIEL
+
+Cuando el usuario corrige el RFC, los archivos `.cer`/`.key` o la contraseña (`KeyPass`) de una Razón Social en la aplicación, el API **detecta automáticamente el cambio** y resetea todos los jobs en estado `Error` de ese RFC a `Pendiente`. El Worker los retoma en el siguiente ciclo de polling (~30 segundos), sin necesidad de esperar al proceso nocturno de las 2 AM.
+
+```
+Usuario edita RS → cambia .cer o .key o KeyPass
+  → API detecta cambio comparando valor viejo vs nuevo
+  → UPDATE DescargaQueue SET Estatus='Pendiente' WHERE RFC=? AND Estatus='Error'
+  → Worker retoma en ~30 segundos
+```
+
+Si solo se cambian datos no relacionados con la autenticación SAT (domicilio, teléfono, etc.), **no se dispara ningún reintento**.
 
 ---
 
