@@ -49,9 +49,9 @@ FiscalApi.Core.dll                FiscalApi.PdfGenerator.dll
 |---|---|---|
 | `IEPS` | MVC Frontend | https://localhost:xxxx |
 | `IEPS.API` | REST API | https://localhost:xxxx/api |
-| `FiscalApi.Worker` | Windows Service | `C:\Sistema\FiscalApi.Worker` |
-| `FiscalApi.Core` | Console App | `C:\Sistema\FiscalApi.Core` |
-| `FiscalApi.PdfGenerator` | Console App | `C:\Sistema\FiscalApi.PdfGenerator` |
+| `FiscalApi.Worker` | Windows Service (5 shards) | `C:\FiscalApi\Worker.Shard{1-5}` |
+| `FiscalApi.Core` | Console App | `C:\FiscalApi\shared-binaries\FiscalApi.Core.dll` |
+| `FiscalApi.PdfGenerator` | Console App | `C:\FiscalApi\shared-binaries\FiscalApi.PdfGenerator.dll` |
 | `FiscalApi.XmlCheck` | Console App | Herramienta auxiliar de validación XML |
 
 ---
@@ -240,6 +240,7 @@ Loop principal (cada 30 segundos, máx 8 jobs en paralelo por shard):
 | `EnProceso` | FiscalApi.Core corriendo ahora |
 | `EnEsperaSAT` | SAT aún no tiene la solicitud lista, reintento programado |
 | `Completado` | Descarga exitosa + PDF generado |
+| `CompletadoVacío` | SAT confirmó que el período no tiene facturas (0 CFDIs vigentes) |
 | `Error` | Falló (ver columna `MensajeError` con descripción legible) |
 
 #### Errores SAT detectados automáticamente
@@ -277,7 +278,7 @@ Re-encola el mes actual para capturar facturas emitidas después de la descarga 
 Horario: Todos los días a las 02:05 AM
 
 Lógica:
-  Si hoy.Day >= 20:
+  Si hoy.Day >= 10:
     Por cada RFC activo (Cat_RazonSocial WHERE IdEstatus = 1):
       ResetOrInsertMesActualAsync(RFC, año, mes, "Recibido")
       ResetOrInsertMesActualAsync(RFC, año, mes, "Emitido")
@@ -342,7 +343,9 @@ FiscalApi.Core.exe test-email {RFC}
 1. Autentica con SAT usando FIEL (archivos .CER / .KEY)
 2. Solicita paquete de descarga (RequestId)
 3. Verifica estatus del paquete (polling hasta que SAT lo prepare)
-   → Si SAT no responde: marca job EnEsperaSAT + ProximoIntento = +N minutos
+   → Si SAT no responde: marca job EnEsperaSAT + ProximoIntento = +30 minutos
+      → Cada 5 intentos acumulados: RequestId=NULL + Pendiente + espera 1h (nueva solicitud al SAT)
+      → Tras 15 intentos acumulados (3 ciclos × 5): marca Error definitivo
 4. Descarga ZIP con XMLs
 5. Extrae XMLs → parsea cada CFDI
 6. Inserta/actualiza registros en tabla CFDIs (con XmlCFDI, UUID, RFC, fechas, totales, etc.)
@@ -353,10 +356,24 @@ FiscalApi.Core.exe test-email {RFC}
 ### Validaciones internas
 
 - **Expiración de token**: renueva antes de continuar
-- **Early-exit por BD**: si ya existen CFDIs en tabla `CFDIs` para ese RFC/mes/tipo y no hay `--force`, omite la solicitud al SAT por completo (evita autenticaciones y polling innecesarios con cientos de razones sociales)
+- **Cache de Metadata SAT**: antes de autenticar con SAT, consulta `DescargaQueue.FacturasMetadata` y `FechaMetadata` para evitar solicitudes innecesarias al SAT:
+  - Si `enBD >= FacturasMetadata` → período completo, skip inmediato (nunca re-verifica)
+  - Si `enBD < FacturasMetadata` y cache no ha expirado → usa el conteo cacheado, procede con descarga CFDI sin llamar a SAT para metadata
+  - Si cache expirado → re-ejecuta pre-check de metadata antes de continuar
+- **Intervalo de cache dinámico**:
+  - Mes actual, días 20–31 → 1 día (re-verifica diario en cierre de mes, cuando más facturas llegan)
+  - Mes actual, días 1–19 → 3 días
+  - Meses históricos → 3 días
+- **Pre-check de Metadata SAT**: justo después de autenticar, consulta SAT con `QueryType.Metadata` para obtener el conteo de CFDIs del período antes de lanzar la solicitud de descarga completa (más lenta y costosa en cuota SAT):
+  - `NumeroCFDIs = 0` → marca job `CompletadoVacío`, no consume cuota de descarga
+  - `NumeroCFDIs > enBD` → faltan facturas, procede con descarga CFDI
+  - `NumeroCFDIs <= enBD` → período ya completo, skip
+  - Error/timeout del pre-check → **fail-open**: procede con descarga CFDI sin bloquear
 - **Reintento con `--force`**: borra ZIPs existentes y re-descarga desde cero
 - **Early-exit por ZIP en disco**: si el ZIP ya existe y `--force` no está activo, lo salta (protege históricos)
-- **Máx. 5 intentos fallidos**: marca el job como Error y loguea "requiere revisión manual"
+- **RequestId vacío**: si el SAT devuelve `RequestId=""`, reintenta hasta 5 veces con ventana de tiempo ligeramente desplazada (offsets en segundos) antes de marcar Error
+- **RequestId vacío en BD**: si el Worker retoma un job con `RequestId=""` guardado, se trata como null y crea una nueva solicitud al SAT
+- **EnEsperaSAT con ciclos**: cada 5 intentos sin respuesta del SAT se descarta el RequestId y se pide solicitud nueva; tras 15 intentos acumulados (3 solicitudes distintas, ~7.5h) marca Error definitivo
 
 ---
 
@@ -441,22 +458,51 @@ FiscalApi.PdfGenerator.exe --test
 | `AnioMes` | Período de descarga (ej: `2025-03`) |
 | `TipoDescarga` | `Recibido` o `Emitido` |
 
+### Columnas clave de DescargaQueue
+
+| Columna | Descripción |
+|---|---|
+| `RFC` | RFC de la Razón Social |
+| `Anio` / `Mes` | Período del job |
+| `TipoDescarga` | `Recibido` o `Emitido` |
+| `Estatus` | Estado actual del job (ver tabla de estatus) |
+| `Shard` | Shard asignado (1–5, calculado por primera letra del RFC) |
+| `FacturasMetadata` | Conteo de CFDIs reportado por SAT en el último pre-check de metadata |
+| `FacturasDescargadas` | Conteo de CFDIs efectivamente descargados |
+| `FechaMetadata` | Fecha en que se ejecutó el último pre-check de metadata (para cache) |
+| `MensajeError` | Descripción legible del error (si `Estatus = 'Error'`) |
+| `RequestId` | ID de solicitud SAT activo (para retomar jobs `EnEsperaSAT`) |
+| `ProximoIntento` | DateTime del siguiente intento para jobs `EnEsperaSAT` |
+| `EsManual` | `1` si fue solicitado desde la UI (prioridad sobre jobs nocturnos) |
+
 ---
 
 ## 🚀 Despliegue
 
+### Worker + Core (servidor)
+
 ```powershell
-# Desde la raíz del repositorio:
-.\deploy.ps1
+# 1. Publicar Worker
+cd FiscalApi.Worker
+dotnet publish -c Release -r win-x64 --self-contained false -o .\publish
+
+# 2. En el servidor: detener shards
+FOR /L %i IN (1,1,5) DO net stop "FiscalApi.Worker.Shard%i"
+
+# 3. Limpiar y reemplazar shared-binaries (eliminar antes para evitar DLLs obsoletos)
+Remove-Item C:\FiscalApi\shared-binaries\* -Recurse -Force
+# Copiar todo el publish al servidor → C:\FiscalApi\shared-binaries\
+
+# 4. Copiar appsettings por shard
+FOR /L %i IN (1,1,5) DO (
+    copy C:\FiscalApi\configs\appsettings.Shard%i.json C:\FiscalApi\Worker.Shard%i\appsettings.json
+)
+
+# 5. Reiniciar shards
+FOR /L %i IN (1,1,5) DO net start "FiscalApi.Worker.Shard%i"
 ```
 
-El script:
-1. Detiene el servicio `FiscalApi.Worker`
-2. Publica y copia al servidor:
-   - `FiscalApi.Worker` → `C:\Sistema\FiscalApi.Worker` (win-x64, self-contained)
-   - `FiscalApi.Core` → `C:\Sistema\FiscalApi.Core` (win-x64, self-contained)
-   - `FiscalApi.PdfGenerator` → `C:\Sistema\FiscalApi.PdfGenerator`
-3. Reinicia el servicio
+> ⚠️ `Fiscalapi.Credentials.dll` es una versión **parchada localmente** (fix para razones sociales con comas en el nombre). Al hacer deploy, copiar la DLL compilada desde `fiscalapi-credentials-net\bin\Release\net8.0\Fiscalapi.Credentials.dll` a `shared-binaries\`, sobreescribiendo la que viene del NuGet.
 
 > ⚠️ El frontend (`IEPS`) y el API (`IEPS.API`) se despliegan por separado (IIS / Visual Studio Publish).
 
