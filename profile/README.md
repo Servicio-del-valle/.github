@@ -270,26 +270,46 @@ Si solo se cambian datos no relacionados con la autenticación SAT (domicilio, t
 
 ---
 
-### 📅 Proceso 2 – MonthlyQueueScheduler
+### 📅 Proceso 2 – MonthlyQueueScheduler (Detección de Facturas Nuevas)
 
-Re-encola el mes actual para capturar facturas emitidas después de la descarga inicial.
+Re-encola **TODOS** los jobs del mes anterior el **día 2 de cada mes** a las 02:05 AM para detectar facturas que llegaron después de la descarga inicial del día 1 (ej: facturas emitidas a las 5 PM cuando el scheduler ya pasó a las 2 AM).
 
 ```
-Horario: Todos los días a las 02:05 AM
+Horario: Día 2 de cada mes a las 02:05 AM
 
-Lógica:
-  Si hoy.Day >= 10:
+Flujo:
+  Si hoy.Day == 2:
+    mesAnterior = hoy - 1 mes
+    UPDATE DescargaQueue
+    SET Estatus = 'Pendiente',
+        EsActualizacion = 1,      ← Fuerza --force (borra ZIPs viejos, re-descarga)
+        FechaInicio = NULL,
+        RequestId = NULL,
+        ...
+    WHERE Anio = mesAnterior.Año
+      AND Mes = mesAnterior.Mes
+      AND Estatus IN ('Completado', 'Pendiente', 'Error', 'EnEsperaSAT')  ← TODOS
+
+  Si hoy.Day >= 10 AND hoy.Day != 1 AND hoy.Day != 2:
     Por cada RFC activo (Cat_RazonSocial WHERE IdEstatus = 1):
-      ResetOrInsertMesActualAsync(RFC, año, mes, "Recibido")
-      ResetOrInsertMesActualAsync(RFC, año, mes, "Emitido")
-
-      ┌─ Job no existe     → INSERT Pendiente (EsActualizacion = 1)
-      ├─ Job Completado    → RESET a Pendiente (se re-descarga con --force)
-      ├─ Job Error         → RESET a Pendiente
-      └─ Job Pendiente/    → Se omite (ya está en cola)
-           EnProceso/
-           EnEsperaSAT
+      ResetOrInsertMesActualAsync(RFC, año_actual, mes_actual, "Recibido")
+      ResetOrInsertMesActualAsync(RFC, año_actual, mes_actual, "Emitido")
+      
+      ┌─ Job no existe → INSERT Pendiente (EsActualizacion = 1)
+      ├─ Job Completado → RESET a Pendiente (se re-descarga)
+      ├─ Job Error → RESET a Pendiente
+      ├─ Job Pendiente → Se omite (ya está en cola)
+      └─ Job EnProceso/EnEsperaSAT → Se omite (se está ejecutando)
 ```
+
+**¿Por qué día 2 en lugar de día 1?**
+- Día 1 es para resetear el mes anterior (al fin del día anterior puede haber facturas pendientes de SAT)
+- Día 2 garantiza que el mes anterior ya está completo en el cierre diario, capturando cualquier factura que se haya emitido entre las 2 AM del día anterior y la medianoche
+- `EsActualizacion = 1` activa el modo `--force` en FiscalApi.Core, borrando ZIPs antiguos y forzando re-descarga para detectar cambios/correcciones del SAT
+
+**Diferencia clave: Resetea TODOS, no solo Error**
+- **Antes**: Solo reseteaba jobs con `Estatus = 'Error'`
+- **Ahora**: Resetea `Completado`, `Pendiente`, `Error`, `EnEsperaSAT` para asegurar que **siempre se re-descarga** el mes anterior y se detectan facturas nuevas o corregidas por el SAT
 
 ---
 
@@ -357,7 +377,8 @@ FiscalApi.Core.exe test-email {RFC}
 
 - **Expiración de token**: renueva antes de continuar
 - **Cache de Metadata SAT**: antes de autenticar con SAT, consulta `DescargaQueue.FacturasMetadata` y `FechaMetadata` para evitar solicitudes innecesarias al SAT:
-  - Si `enBD >= FacturasMetadata` → período completo, skip inmediato (nunca re-verifica)
+  - Si `enBD >= FacturasMetadata` Y es descarga automática → período completo, skip inmediato (nunca re-verifica)
+  - Si es descarga manual → **SIEMPRE procede**, ignorando el conteo cacheado (detecta nuevas facturas en rangos de fechas específicas)
   - Si `enBD < FacturasMetadata` y cache no ha expirado → usa el conteo cacheado, procede con descarga CFDI sin llamar a SAT para metadata
   - Si cache expirado → re-ejecuta pre-check de metadata antes de continuar
 - **Intervalo de cache dinámico**:
@@ -367,13 +388,19 @@ FiscalApi.Core.exe test-email {RFC}
 - **Pre-check de Metadata SAT**: justo después de autenticar, consulta SAT con `QueryType.Metadata` para obtener el conteo de CFDIs del período antes de lanzar la solicitud de descarga completa (más lenta y costosa en cuota SAT):
   - `NumeroCFDIs = 0` → marca job `CompletadoVacío`, no consume cuota de descarga
   - `NumeroCFDIs > enBD` → faltan facturas, procede con descarga CFDI
-  - `NumeroCFDIs <= enBD` → período ya completo, skip
+  - `NumeroCFDIs <= enBD` Y es automática → período ya completo, skip
+  - `NumeroCFDIs <= enBD` Y es manual → **procede igual**, permite re-validar manualmente
   - Error/timeout del pre-check → **fail-open**: procede con descarga CFDI sin bloquear
-- **Reintento con `--force`**: borra ZIPs existentes y re-descarga desde cero
+- **Reintento con `--force`**: borra ZIPs existentes y re-descarga desde cero. Activado cuando:
+  - Usuario solicita re-descarga manual desde UI (`--force` explícito)
+  - MonthlyScheduler resetea job con `EsActualizacion = 1` (detección de facturas nuevas del mes anterior)
 - **Early-exit por ZIP en disco**: si el ZIP ya existe y `--force` no está activo, lo salta (protege históricos)
 - **RequestId vacío**: si el SAT devuelve `RequestId=""`, reintenta hasta 5 veces con ventana de tiempo ligeramente desplazada (offsets en segundos) antes de marcar Error
 - **RequestId vacío en BD**: si el Worker retoma un job con `RequestId=""` guardado, se trata como null y crea una nueva solicitud al SAT
 - **EnEsperaSAT con ciclos**: cada 5 intentos sin respuesta del SAT se descarta el RequestId y se pide solicitud nueva; tras 15 intentos acumulados (3 solicitudes distintas, ~7.5h) marca Error definitivo
+- **Generación automática de PDFs**: tras procesar exitosamente todos los XMLs de un mes, invoca automáticamente `FiscalApi.PdfGenerator` para generar y guardar PDFs de los CFDIs descargados (no requiere ejecución manual posterior)
+
+---
 
 ---
 
